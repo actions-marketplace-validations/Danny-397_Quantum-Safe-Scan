@@ -3,6 +3,139 @@
 All notable changes to QuantumSafe are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.3.1] — 2026-10-28
+
+### Fixed
+- **TLS 1.0/1.1 no longer flags the flags that turn them off.** The rule matched
+  `SSLv3` / `TLSv1` inside disable flags (`OP_NO_SSLv3`, `OP_NO_TLSv1`,
+  `_OP_NO_SSLv2_OR_SSLv3`), which are the mitigation, not exposure; in a random
+  sample of real-world findings every TLS 1.0 hit was one of these. The protocol
+  name must now start its own token. Explicit selectors (`PROTOCOL_TLSv1`,
+  `SSLv3_METHOD`, `TLSVersion.TLSv1`) still fire, and `TLSVersion.TLSv1_1`, which
+  was missed before, is now caught.
+
+### Added
+- **Precision on real code** (`benchmark/precision_sample.py`): 100 findings drawn
+  at random from 37 pinned PyPI packages and labeled by hand — 93% (95% CI
+  86–97%), measured before the TLS fix. A measured Semgrep row in the comparison.
+
+### Security
+- **Rate limits are per visitor.** The limiter keyed on the socket address, and
+  behind Render's proxy that is the same for everyone, so every limit was
+  site-wide: 20 logins and 5 password resets per hour for all users together, and
+  one person retrying could lock everyone out. Keyed on `CF-Connecting-IP`
+  (Render serves through Cloudflare, which overwrites it), falling back to the
+  socket address locally.
+- **Password-reset links are single-use.** A link carried only the user id and
+  stayed valid for its whole hour, including after it had been used. It now
+  carries a fingerprint of the password hash it was issued against, so it stops
+  verifying once the password changes.
+- **Zip bombs are refused before extraction.** The 25 MB limit was on the
+  compressed upload; an archive declaring more than 250 MB uncompressed or more
+  than 20,000 files is now rejected before anything is written.
+- **Oversized uploads are refused at the door** (`MAX_CONTENT_LENGTH`, JSON 413)
+  instead of being written to disk before the size check.
+- **The API refuses to start on Render with the public default secret**, which
+  would let anyone forge sign-in and reset tokens. (Production was checked and
+  is not affected; this guards future deploys.)
+
+## [0.3.0] — 2026-10-26
+
+### Added
+- **Migration horizon — Mosca's inequality (`horizon.py`).** The risk score says
+  *how much* vulnerable cryptography exists; it cannot say whether the migration
+  finishes in time. `--secrecy-years X` (and optionally `--crqc-years Z`) applies
+  `X + Y > Z`, where Y is estimated from the findings. Deliberately refuses to
+  invent Z: there is no default, omitting it yields `no_verdict` rather than a
+  guess, and the always-computable **break-even year** needs no estimate of Z at
+  all. Y is a range, counted per cryptographic *family* rather than per finding
+  (the design decision is paid once; call sites scale sub-linearly at
+  `1 + log2(n)/2`, capped at 4×), and all six coefficients are emitted under
+  `horizon.assumptions`.
+- **Live TLS endpoint scanning (`tlsscan.py`, `--url`, `POST /api/v1/scan-url`).**
+  Reports the negotiated key exchange, protocol and cipher for an HTTPS host.
+  TLS 1.3 removed the key exchange from the cipher suite name and Python's `ssl`
+  cannot read the `key_share` group (`set_groups`/`group_used` need OpenSSL 3.5+
+  and Python 3.14), so the ClientHello is built by hand: offer the hybrid groups
+  but a `key_share` for X25519 only, and a server preferring a hybrid must answer
+  with a HelloRetryRequest naming it (RFC 8446 §4.1.3). No new dependencies;
+  89–257 ms. Behind an SSRF guard — https only, ports 443/8443, every resolved
+  address must be public (including the IPv4-mapped IPv6 forms of loopback,
+  RFC 1918, link-local/cloud-metadata and CGNAT), rejecting on *any* private
+  answer and connecting to the address that was checked rather than re-resolving.
+  Rate-limited to 10/hour. Scope is one handshake — what a browser does on every
+  visit — not port or vulnerability scanning.
+- **Certificate chain analysis (`certchain.py`).** Every signature in the chain,
+  not just the leaf: cloudflare.com's leaf is ECDSA P-256 while an intermediate
+  above it is signed SHA-256 with RSA, which a leaf-only check misses. Includes a
+  minimal DER/ASN.1 reader, since the signature algorithm and public key are the
+  two fields `ssl.getpeercert()` omits and the package takes no `cryptography`
+  dependency. Certificate findings state that the risk is *forgery of future
+  certificates*, not retroactive like the key exchange; a root's self-signature
+  is shown but not scored, because a root is trusted via the client's trust store.
+- **Scan diffing (`diff.py`, `--baseline`, `--fail-on-new`,
+  `GET /api/v1/scans/{id}/diff`).** Lets CI ratchet — tolerate an existing
+  backlog, fail only when it grows, which `--fail-on-high` cannot do without
+  failing every build from day one. Findings are identified *without* their line
+  number, so a reformat is not reported as a fix plus a regression, with counts
+  tracked per key. The verdict is driven by new findings, never the score delta:
+  the score caps at 100, so a codebase already at the cap can acquire new HIGH
+  findings with the number unmoved.
+- **`baseline` / `fail-on-new` inputs on the GitHub Action.** A missing baseline
+  file warns and skips the comparison instead of failing, so a first run works.
+- **Migration horizon on the dashboard** (`POST /api/v1/horizon`, scan results page).
+  Two controls -- how long the data must stay confidential, and a slider for the
+  quantum year -- with the verdict flipping live between ALREADY TOO LATE / AT RISK /
+  ON TRACK. Y is estimated server-side from the findings and fetched **once**, so the
+  effort model stays single-sourced with the CLI; the sliders then recompute
+  `X + Y > Z` locally, because a round trip per drag would make the control unusable.
+  Only each finding's `family` crosses the wire -- file paths and snippets are
+  irrelevant to the estimate. The card carries a "What this refuses to claim" panel
+  listing all six coefficients, and degrades to hidden if the backend is cold, since
+  the findings table is the point of that page.
+- **"Scan a live website" on the dashboard.** The home page exposes the TLS scan
+  with the key exchange, protocol, cipher and full certificate chain rendered,
+  and shows the server's own refusal reason for a rejected target.
+- **Third-party origin sweep (`origins.py`, `--origins`).** A site can negotiate a
+  hybrid on its own domain and still pull scripts, fonts and analytics from a dozen
+  other origins over classical key exchange. Measured on `github.com`: 2 of 5
+  third-party origins post-quantum, 3 classical. Produces one aggregate finding rather
+  than one per origin, at MEDIUM when the page's own key exchange is fine, because a
+  third-party server is not the author's to fix. A page is attacker-controlled input,
+  so the SSRF guard runs on every *discovered* origin, not once on the entry URL;
+  markup pointing at `169.254.169.254` is refused and recorded, never followed. Page
+  size, origin count and each handshake are all bounded. No HTML dependency —
+  `html.parser` is in the standard library.
+- **`pqc_hybrid` and `pqc_signature` families**, with `NO_ACTION_FAMILIES`
+  marking families that are reported but need no migration — so an endpoint that
+  has already migrated is not billed migration effort, and a post-quantum key
+  exchange is not told to consider SHA-384.
+
+- **A CI check that the documented test counts are true**
+  (`tools/check_test_count.py`). Every "N tests" in the README and the technical
+  report is a claim a reader can check by cloning and running pytest, so a stale
+  one is a published inaccuracy. Keeping them current by hand did not work -- they
+  drifted five times in a day of feature work, and the figure that stayed wrong
+  longest was a shields badge, because the badge spells the number differently
+  from the prose and searching for one does not find the other. The check
+  collects the count from pytest, compares it against every documented figure,
+  fails the build on a mismatch, and also fails if a pattern stops matching --
+  which is what would otherwise happen silently when the wording is reworded.
+  `--fix` rewrites the counts in place.
+
+### Fixed
+- **SARIF no longer invents a file and a line for endpoint findings.** They were
+  emitted with `artifactLocation.uri` set to a bare host plus a bracketed suffix
+  and a fabricated `startLine: 1` — schema-valid, but it would make GitHub code
+  scanning annotate a file that does not exist. Endpoint findings now carry the
+  real `https://host` URI, no region, and the certificate position as a
+  `logicalLocation`.
+- `api()` in the dashboard now attaches the HTTP status to the errors it throws,
+  so a deliberate 400 refusal is shown immediately rather than sitting through a
+  retry intended for a cold backend.
+
 ## [0.2.0] — 2026-07-18
 
 ### Added
@@ -76,5 +209,8 @@ All notable changes to QuantumSafe are documented here. This project follows
   security disclosure policy (SECURITY.md + security.txt).
 - **Quality:** 45-test pytest suite, GitHub Actions CI, demo seed script.
 
+[Unreleased]: https://github.com/Danny-397/Quantum-Safe-Scan/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/Danny-397/Quantum-Safe-Scan/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/Danny-397/Quantum-Safe-Scan/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Danny-397/Quantum-Safe-Scan/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Danny-397/Quantum-Safe-Scan/releases/tag/v0.1.0

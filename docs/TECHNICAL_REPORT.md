@@ -178,13 +178,13 @@ methodology and a capability matrix vs. Semgrep/SonarQube/CBOM tools in
 latest sdist of **37 of the most-downloaded PyPI packages** straight from the PyPI JSON
 API and scans them (nothing is built or executed):
 
-- **32 of 37 (86%)** contained ≥1 finding; **10,938** Python files analyzed;
-- **5,512** total findings, **4,083 HIGH-risk**;
+- **32 of 37 (86%)** contained ≥1 finding; **11,275** Python files analyzed;
+- **5,609** total findings, **4,236 HIGH-risk** (run of 2026-10-28, scanner 0.3.1);
 - every finding is a concrete `file:line` an auditor can open — e.g. Diffie–Hellman in
   `twisted/conch/ssh/transport.py`, MD5 in `requests/auth.py` (HTTP Digest).
 
-The paramiko case shows why usage-awareness matters at scale: a naive line-regex reports
-**451 raw matches**, most of them the same algorithms repeated in docstrings and SSH
+The paramiko case shows why usage-awareness matters at scale: on paramiko 5.0.0 (July 2026
+run) a naive line-regex reports **451 raw matches**, most of them the same algorithms repeated in docstrings and SSH
 protocol-name strings; focusing on real code brings it to **110** findings — a ~4× noise
 reduction. *(Honest caveat: some of the 37 packages are cryptography libraries that
 implement RSA/ECC on purpose, so their large counts are expected; the telling signal is
@@ -206,16 +206,102 @@ NIST standardized lattice schemes. *(Honest scope: this is a faithful teaching
 implementation of plain LWE, not the constant-time Module-LWE + NTT + Fujisaki–Okamoto
 construction of production Kyber; real systems should use vetted ML-KEM such as `liboqs`.)*
 
-## 6. Engineering
+## 6. Beyond the codebase: live endpoints and deadlines
 
-One shared engine behind CLI + API + dashboard; **97 automated tests**; CI; Docker and
+Two things a code scan cannot answer: what a deployed service actually negotiates,
+and whether the migration finishes in time.
+
+**The TLS handshake (`cli/tlsscan.py`).** A website's quantum exposure is not in its
+source — it is in two brief public-key steps of the handshake. The **key exchange** is
+the urgent one: Shor recovers the session secret, and because an adversary can record
+traffic now and decrypt it later, data sent today is exposed *retroactively*. The
+**certificate signature** is also Shor-breakable, but only to forge *future*
+certificates, and those rotate every ~90 days. Symmetric cryptography is not the
+problem at all: Grover square-roots a brute-force search, so AES-128 retains ~64-bit
+security and AES-256 is comfortable.
+
+Reading the key exchange needed a hand-built ClientHello. TLS 1.2 named the key exchange
+in the cipher suite (`ECDHE_RSA_WITH_AES_128_GCM_SHA256`); TLS 1.3 removed it, so every
+modern site reports only `TLS_AES_128_GCM_SHA256` — which says nothing. The group lives
+in the `key_share` extension, and Python's `ssl` cannot report it (`set_groups` and
+`group_used` need OpenSSL 3.5+ and Python 3.14; ML-KEM groups need OpenSSL 3.5 at all).
+So the scanner offers the hybrid groups in `supported_groups` but a `key_share` for
+X25519 only: a server preferring a hybrid cannot proceed from that share and must answer
+with a HelloRetryRequest naming the group it wants (RFC 8446 §4.1.3). No ML-KEM
+implementation and no new dependency are needed to ask the question. One handshake,
+89–257 ms.
+
+**The whole certificate chain (`cli/certchain.py`).** A chain is only as strong as its
+weakest signature, and the weak link is usually not the leaf: `cloudflare.com` serves an
+ECDSA P-256 leaf, but an intermediate above it is signed **SHA-256 with RSA**. Forging
+that signature mints a leaf for any name beneath it. The signature algorithm and public
+key are precisely the two fields `ssl.getpeercert()` omits, so rather than take on a
+`cryptography` dependency they are walked out of the DER with a minimal
+tag-length-value reader that parses structure and OIDs and verifies nothing — `ssl` has
+already validated the chain by then. A root's self-signature is shown but not scored: a
+root is trusted because it is in the client's trust store, so forging that signature
+gains an attacker nothing.
+
+**Mosca's inequality (`cli/horizon.py`).** The risk score says *how much* vulnerable
+cryptography exists. It cannot say whether the migration lands in time, which is the
+question the threat model actually poses: one RSA key exchange protecting data that must
+stay secret for fifty years is worse than forty MD5 checksums.
+
+```
+X  how long the data must stay confidential
+Y  how long the migration takes
+Z  how long until a quantum computer can break it
+
+X + Y > Z   ->   data sent today is already exposed
+```
+
+What the tool refuses to claim matters as much as what it reports. **Z is unknowable, so
+there is no default for it** — omitting it yields `no_verdict` rather than a guess. What
+is always computed is the **break-even year**: the latest a quantum computer could arrive
+while still leaving time to migrate, which needs no estimate of Z and is a property of
+the code and the data rather than a forecast. Y is an engineering estimate, so it is a
+range, counted per cryptographic *family* rather than per finding (the design decision is
+paid once; call sites scale sub-linearly), and all six coefficients are emitted under
+`horizon.assumptions` so a reader can reject a specific number instead of the whole figure.
+
+**The origins a page depends on (`cli/origins.py`).** A site can negotiate a hybrid on
+its own domain and still pull scripts, fonts and analytics from a dozen other origins
+over classical key exchange — and the author chose every one of them, so the weakest is
+part of the page's exposure. `--origins` fetches the entry page, extracts the hosts its
+sub-resources reference, and runs the same scan against each. Measured on
+`github.com`: **2 of 5 third-party origins post-quantum, 3 classical.** On
+`quantumsafescan.com`: 2 of 2 ready.
+
+The result is one aggregate finding rather than one per origin — a dozen separate HIGHs
+for other people's servers would bury the findings a reader can act on — and it is
+MEDIUM rather than HIGH when the page's own key exchange is fine, because a third-party
+server is not the author's to fix. The action there is to drop the dependency or press
+the vendor, which is a different call to action from repairing your own endpoint.
+
+A page is attacker-controlled input, so the SSRF guard is applied to every *discovered*
+origin rather than once to the entry URL and then trusted: anyone can publish markup
+whose script tags point at `169.254.169.254`, and a sweep that followed what it found
+would be an SSRF with extra steps. The page read, the origin count and each handshake
+are all bounded, so one hostile page cannot turn a scan into an unbounded crawl.
+
+**Scanning someone else's server** is bounded to a single TLS handshake — what any
+browser does on every visit. It is not port or vulnerability scanning. The target must
+resolve *entirely* to public addresses on port 443/8443, and the connection is made to
+the address that was checked rather than re-resolved, which closes the DNS-rebinding
+window; private ranges, loopback, link-local (cloud instance metadata at
+`169.254.169.254`), carrier-grade NAT and the IPv4-mapped IPv6 forms of all of them are
+refused.
+
+## 7. Engineering
+
+One shared engine behind CLI + API + dashboard; **559 automated tests**; CI; Docker and
 `docker-compose`; a reusable **GitHub Action** (`action.yml`) that fails a build over a
 risk threshold; multi-service deploy configs; and a published PyPI package
-(`pip install quantumsafe-scan`, v0.2.0). The benchmark, real-world study, seeded recall
+(`pip install quantumsafe-scan`, v0.3.0). The benchmark, real-world study, seeded recall
 harness, comparison, and every chart are **reproducible from scripts** and generated
 from live scanner output, not hand-drawn.
 
-## 7. Honest limitations
+## 8. Honest limitations
 
 - **Heuristic, not a proof.** It detects *usage patterns*; reachability is a conservative
   ranking signal, not a proof that a primitive is exploitable or live.
@@ -233,8 +319,24 @@ from live scanner output, not hand-drawn.
   the seeded harness adds 50 constructed recall cases. Neither is a claim of 100% on
   arbitrary real-world code.
 - **Demonstration scale.** Shor runs on `N = 15`; the LWE KEM is teaching-grade.
+- **The TLS scan reports what a server *selects*, not everything it supports.** The
+  result is the group chosen from the set offered — the same answer a browser offering
+  that set would get — so a server that supports a hybrid but ranks it lower reads as
+  classical. Findings say "negotiated", not "supports", for exactly that reason.
+- **One endpoint per handshake, and only the entry page is fetched.** `--origins`
+  sweeps the hosts a page's sub-resources reference, but it does not follow redirects,
+  probe other ports, or recurse into those origins' own dependencies, and it reads
+  markup only — a resource pulled later by JavaScript is invisible to it.
+- **Migration time is an estimate, not a measurement.** The horizon's coefficients are
+  assumptions about how long cryptographic work takes, and they are printed alongside
+  the result precisely because they should be replaced with figures from a real
+  migration. The break-even year is the only number there that rests on no guess about
+  the future.
+- **A diff cannot prove a fix.** A finding that disappeared may have been deleted,
+  excluded or renamed — a rename reads as one fixed plus one new. The diff reports
+  counts and locations, not conclusions, and says so in its own output.
 
-## 8. What's next
+## 9. What's next
 
 Tree-sitter AST parsing to bring non-Python languages up to AST-level precision;
 import-resolving reachability (the taint pass is already cross-file); a larger hand-labeled real-world

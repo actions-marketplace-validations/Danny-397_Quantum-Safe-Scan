@@ -66,15 +66,38 @@ def cmd_auth(args: argparse.Namespace) -> int:
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
-    if bool(args.path) == bool(args.repo):
-        print("Error: provide exactly one of --path or --repo.", file=sys.stderr)
+    chosen = [n for n in ("path", "repo", "url") if getattr(args, n, None)]
+    if len(chosen) != 1:
+        print("Error: provide exactly one of --path, --repo or --url.",
+              file=sys.stderr)
+        return 2
+    # Z on its own says nothing: the inequality needs X. Fail rather than
+    # silently ignore the flag the user bothered to pass.
+    if args.origins and not args.url:
+        print("Error: --origins needs --url (there are no third-party origins "
+              "to sweep in a local path or a repository).", file=sys.stderr)
+        return 2
+    if args.crqc_years is not None and args.secrecy_years is None:
+        print("Error: --crqc-years needs --secrecy-years (Mosca's inequality "
+              "compares X + Y against Z; without X there is nothing to compare).",
+              file=sys.stderr)
         return 2
 
     exclude = args.exclude or None
     scan_deps = not args.no_deps
     reachability = not args.no_rank
+    endpoint = None
     try:
-        if args.repo:
+        if args.url:
+            from .tlsscan import scan_url
+            target = args.url
+            findings, endpoint = scan_url(args.url)
+            if args.origins:
+                from .origins import sweep
+                origin_findings, origin_summary = sweep(args.url)
+                findings = findings + origin_findings
+                endpoint["third_party"] = origin_summary
+        elif args.repo:
             target = args.repo
             findings = scan_repo(args.repo, exclude=exclude, taint=args.taint,
                                  scan_deps=scan_deps, reachability=reachability)
@@ -82,11 +105,16 @@ def cmd_scan(args: argparse.Namespace) -> int:
             target = os.path.abspath(args.path)
             findings = scan_path(args.path, exclude=exclude, taint=args.taint,
                                  scan_deps=scan_deps, reachability=reachability)
-    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+    except (FileNotFoundError, ValueError, RuntimeError, OSError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    report = reporter.build_report(findings, target)
+    report = reporter.build_report(
+        findings, target,
+        endpoint=endpoint,
+        secrecy_years=getattr(args, "secrecy_years", None),
+        crqc_years=getattr(args, "crqc_years", None),
+    )
 
     if args.output:
         name = args.output.lower()
@@ -115,7 +143,30 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
     _maybe_sync(report, args.no_sync)
 
-    # Non-zero exit on HIGH findings so the CLI is CI-friendly.
+    regressed = False
+    if args.baseline:
+        import json as _json
+        from .diff import diff_reports
+        try:
+            with open(args.baseline, encoding="utf-8") as fh:
+                baseline = _json.load(fh)
+        except (OSError, ValueError) as exc:
+            print(f"Error: could not read baseline {args.baseline!r}: {exc}",
+                  file=sys.stderr)
+            return 2
+        d = diff_reports(baseline, report)
+        reporter.print_diff(d.to_dict())
+        regressed = d.regressed
+
+    # Non-zero exit for CI. --fail-on-new is the ratchet: tolerate the existing
+    # backlog, fail only when it grows.
+    if args.fail_on_new:
+        if not args.baseline:
+            print("Error: --fail-on-new needs --baseline to compare against.",
+                  file=sys.stderr)
+            return 2
+        if regressed:
+            return 1
     return 1 if report["summary"]["high"] > 0 and args.fail_on_high else 0
 
 
@@ -175,6 +226,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan = sub.add_parser("scan", help="Scan a local path or GitHub repo.")
     p_scan.add_argument("--path", help="Local directory or file to scan.")
     p_scan.add_argument("--repo", help="Public GitHub repository URL to scan.")
+    p_scan.add_argument("--origins", action="store_true",
+                        help="With --url, also scan the TLS of every third-party "
+                             "origin the page loads from (fonts, CDNs, analytics). "
+                             "A site can be post-quantum on its own domain while "
+                             "its dependencies are not. Costs one handshake per "
+                             "origin, so it is opt-in.")
+    p_scan.add_argument("--url", metavar="HOST",
+                        help="Live HTTPS endpoint to scan (e.g. example.com). "
+                             "Reports the TLS key exchange -- including whether "
+                             "a post-quantum hybrid was negotiated -- plus the "
+                             "protocol version and cipher. One handshake, which "
+                             "is what any browser does; no port or vulnerability "
+                             "scanning.")
     p_scan.add_argument("--output",
                         help="Write report to this file: .json, .cbom.json (CycloneDX CBOM), "
                              ".html, .sarif, or .svg (risk badge).")
@@ -196,8 +260,26 @@ def build_parser() -> argparse.ArgumentParser:
                              "exploitable findings sort above dead or example code.")
     p_scan.add_argument("--fail-on-high", action="store_true",
                         help="Exit with code 1 if any HIGH-risk finding is present (for CI).")
+    p_scan.add_argument("--baseline", metavar="REPORT.json",
+                        help="Compare this scan against a previously saved JSON "
+                             "report and print what was fixed, what is new and "
+                             "what is unchanged.")
+    p_scan.add_argument("--fail-on-new", action="store_true",
+                        help="With --baseline, exit 1 only when the scan finds "
+                             "something NEW. Lets CI ratchet down an existing "
+                             "backlog instead of failing every build on it.")
     p_scan.add_argument("--no-sync", action="store_true",
                         help="Don't upload results to your linked dashboard account.")
+    p_scan.add_argument("--secrecy-years", type=float, metavar="X",
+                        help="How long the data this code protects must stay "
+                             "confidential, in years (a session cookie: ~0; health "
+                             "records: ~50). Enables the horizon assessment: whether "
+                             "the migration finishes before that data is exposed.")
+    p_scan.add_argument("--crqc-years", type=float, metavar="Z",
+                        help="Years until you assume a cryptographically relevant "
+                             "quantum computer exists. No default is supplied because "
+                             "nobody knows it; omit it and you still get the break-even "
+                             "year, which requires no such assumption.")
     p_scan.set_defaults(func=cmd_scan)
 
     p_version = sub.add_parser("version", help="Print the version.")

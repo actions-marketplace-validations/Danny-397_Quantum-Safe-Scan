@@ -17,7 +17,7 @@ from sqlalchemy import func
 
 from auth import api_key_or_jwt, current_user, optional_user, send_email
 from extensions import db, limiter
-from models import Finding, Scan, User, generate_api_key
+from models import Scan, User, generate_api_key
 from quantumsafe.recommender import recommend
 from quantumsafe.reporter import build_report, to_badge_svg, to_cbom, to_html, to_sarif
 from quantumsafe.scanner import EXT_TO_LANG, scan_path
@@ -188,6 +188,62 @@ def get_scan(scan_id: int):
     if scan is None:
         return jsonify({"error": "Scan not found."}), 404
     return jsonify({"scan": scan.to_dict(include_findings=True)})
+
+
+def _scan_as_report(scan: Scan) -> dict:
+    """A Scan row in the shape diff.diff_reports expects.
+
+    The row stores the location as repo_url; the canonical report calls it
+    target.
+    """
+    data = scan.to_dict(include_findings=True)
+    data["target"] = data.get("repo_url", "")
+    return data
+
+
+@api_bp.route("/scans/<int:scan_id>/diff", methods=["GET"])
+@jwt_required()
+def diff_scan(scan_id: int):
+    """Compare two of the caller's own scans: fixed / new / unchanged.
+
+    ``?against=<id>`` names the baseline; omitted, it defaults to the scan
+    immediately before this one, which is the common case of "what changed
+    since last time".
+
+    Both scans are looked up scoped to the authenticated user, so one account
+    cannot diff against another's history -- and a scan belonging to someone
+    else is reported as not found rather than as forbidden, which would
+    confirm that the id exists.
+    """
+    from quantumsafe.diff import diff_reports
+
+    user = _require_user()
+    current = Scan.query.filter_by(id=scan_id, user_id=user.id).first()
+    if current is None:
+        return jsonify({"error": "Scan not found."}), 404
+
+    against = request.args.get("against", type=int)
+    if against is not None:
+        baseline = Scan.query.filter_by(id=against, user_id=user.id).first()
+        if baseline is None:
+            return jsonify({"error": "Baseline scan not found."}), 404
+    else:
+        baseline = (Scan.query
+                    .filter(Scan.user_id == user.id, Scan.id < current.id)
+                    .order_by(Scan.id.desc())
+                    .first())
+        if baseline is None:
+            return jsonify({"error": "No earlier scan to compare against."}), 404
+
+    if baseline.id == current.id:
+        return jsonify({"error": "Cannot diff a scan against itself."}), 400
+
+    d = diff_reports(_scan_as_report(baseline), _scan_as_report(current))
+    return jsonify({
+        "diff": d.to_dict(),
+        "baseline_scan_id": baseline.id,
+        "scan_id": current.id,
+    })
 
 
 def _render_export(report: dict, fmt: str, filename_base: str):
@@ -424,6 +480,94 @@ def demo_scan():
             fh.write(code)
         findings = scan_path(tmp)
     return jsonify({"report": build_report(findings, "in-browser snippet")})
+
+
+@api_bp.route("/horizon", methods=["POST"])
+@limiter.limit("120 per hour")
+def horizon_endpoint():
+    """Apply Mosca's inequality to a set of findings. Stores nothing.
+
+    Only each finding's ``family`` is read -- the migration estimate depends on
+    which cryptographic decisions have to be made, not on file paths or
+    snippets, so nothing else needs to cross the wire.
+
+    The dashboard calls this once and then recomputes the verdict locally as
+    the visitor moves the sliders: X + Y > Z is arithmetic, and a round trip
+    per drag would make the control unusable. The effort model that produces Y
+    stays here, single-sourced with the CLI.
+    """
+    from quantumsafe.horizon import assess
+    from quantumsafe.scanner import Finding
+
+    data = request.get_json(silent=True) or {}
+    raw = data.get("findings")
+    if not isinstance(raw, list):
+        return jsonify({"error": "Provide a 'findings' list."}), 400
+    if len(raw) > 5000:
+        return jsonify({"error": "Too many findings (5000 max)."}), 413
+
+    def number(key, default=None, limit=500.0):
+        value = data.get(key, default)
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} must be a number.")
+        if not 0 <= value <= limit:
+            raise ValueError(f"{key} must be between 0 and {limit:g}.")
+        return value
+
+    try:
+        secrecy = number("secrecy_years", 0.0)
+        crqc = number("crqc_years", None)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    findings = [
+        Finding(file_path="", line_number=0, algorithm="", risk_level="LOW",
+                why="", family=str(f.get("family") or ""))
+        for f in raw if isinstance(f, dict)
+    ]
+    return jsonify({"horizon": assess(findings, secrecy, crqc).to_dict()})
+
+
+@api_bp.route("/scan-url", methods=["POST"])
+# Deliberately tighter than demo-scan. This endpoint opens an outbound
+# connection to a host the caller names, so a generous limit would turn the
+# service into a scanning proxy pointed at someone else's infrastructure.
+@limiter.limit("10 per hour")
+@limiter.limit("60 per day")
+def scan_url_endpoint():
+    """Public, rate-limited TLS scan of one HTTPS endpoint.
+
+    Performs a single TLS handshake -- what any browser does on every visit --
+    and reports the key exchange, protocol version and cipher. Nothing is
+    stored. See quantumsafe.tlsscan for the SSRF guard: the target must resolve
+    entirely to public addresses on port 443/8443, and the connection is made
+    to the address that was actually checked.
+    """
+    from quantumsafe.tlsscan import UnsafeTarget, scan_url
+
+    data = request.get_json(silent=True) or {}
+    target = data.get("url") or data.get("host") or ""
+    if not isinstance(target, str) or not target.strip():
+        return jsonify({"error": "Provide a 'url' to scan, e.g. example.com."}), 400
+    if len(target) > 255:
+        return jsonify({"error": "Target too long."}), 400
+
+    try:
+        findings, endpoint = scan_url(target)
+    except UnsafeTarget as exc:
+        # Refused on purpose; tell the caller which rule they hit.
+        return jsonify({"error": str(exc)}), 400
+    except (OSError, ConnectionError) as exc:
+        # The handshake itself failed: unreachable, timed out, or not TLS.
+        return jsonify({"error": f"Could not complete a TLS handshake: {exc}"}), 502
+
+    return jsonify({
+        "report": build_report(findings, endpoint["host"], endpoint=endpoint)
+    })
 
 
 @api_bp.route("/user/data", methods=["GET"])

@@ -5,13 +5,13 @@
 <p>
   <a href="https://pypi.org/project/quantumsafe-scan/"><img src="https://img.shields.io/pypi/v/quantumsafe-scan?style=flat-square&logo=pypi&logoColor=white&color=5b73e8" alt="PyPI version"></a>
   <img src="https://img.shields.io/pypi/pyversions/quantumsafe-scan?style=flat-square&logo=python&logoColor=white" alt="Python versions">
-  <a href="https://github.com/Danny-397/Quantum-Safe/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Danny-397/Quantum-Safe/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI" alt="CI status"></a>
-  <a href="https://github.com/Danny-397/Quantum-Safe/tags"><img src="https://img.shields.io/github/v/tag/Danny-397/Quantum-Safe?style=flat-square&logo=github&label=version&color=5b73e8" alt="Latest version"></a>
-  <a href="https://github.com/Danny-397/Quantum-Safe/stargazers"><img src="https://img.shields.io/github/stars/Danny-397/Quantum-Safe?style=flat-square&logo=github" alt="Stars"></a>
-  <img src="https://img.shields.io/github/last-commit/Danny-397/Quantum-Safe?style=flat-square&color=555" alt="Last commit">
-  <img src="https://img.shields.io/github/license/Danny-397/Quantum-Safe?style=flat-square&color=3fb950" alt="License: MIT">
+  <a href="https://github.com/Danny-397/Quantum-Safe-Scan/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Danny-397/Quantum-Safe-Scan/ci.yml?branch=main&style=flat-square&logo=githubactions&logoColor=white&label=CI" alt="CI status"></a>
+  <a href="https://github.com/Danny-397/Quantum-Safe-Scan/tags"><img src="https://img.shields.io/github/v/tag/Danny-397/Quantum-Safe-Scan?style=flat-square&logo=github&label=version&color=5b73e8" alt="Latest version"></a>
+  <a href="https://github.com/Danny-397/Quantum-Safe-Scan/stargazers"><img src="https://img.shields.io/github/stars/Danny-397/Quantum-Safe-Scan?style=flat-square&logo=github" alt="Stars"></a>
+  <img src="https://img.shields.io/github/last-commit/Danny-397/Quantum-Safe-Scan?style=flat-square&color=555" alt="Last commit">
+  <img src="https://img.shields.io/github/license/Danny-397/Quantum-Safe-Scan?style=flat-square&color=3fb950" alt="License: MIT">
   <br>
-  <img src="https://img.shields.io/badge/tests-80%20passing-3fb950?style=flat-square&logo=pytest&logoColor=white" alt="80 tests passing">
+  <img src="https://img.shields.io/badge/tests-559%20passing-3fb950?style=flat-square&logo=pytest&logoColor=white" alt="559 tests passing">
   <img src="https://img.shields.io/badge/benchmark-100%25%20precision-3fb950?style=flat-square" alt="100% precision on benchmark">
   <img src="https://img.shields.io/badge/SARIF%202.1.0-schema--validated-3fb950?style=flat-square" alt="SARIF schema-validated">
   <img src="https://img.shields.io/badge/NIST-FIPS%20203%2F204%2F205-5b73e8?style=flat-square" alt="NIST FIPS 203/204/205">
@@ -26,7 +26,7 @@
 <a href="https://pypi.org/project/quantumsafe-scan/"><b>Install</b></a> &nbsp;&middot;&nbsp;
 <a href="docs/WHITEPAPER.md"><b>Documentation</b></a> &nbsp;&middot;&nbsp;
 <a href="#the-three-layers"><b>How it works</b></a> &nbsp;&middot;&nbsp;
-<a href="https://github.com/Danny-397/Quantum-Safe/issues"><b>Report a bug</b></a>
+<a href="https://github.com/Danny-397/Quantum-Safe-Scan/issues"><b>Report a bug</b></a>
 
 </div>
 
@@ -59,7 +59,7 @@ solution:
 | Layer | Module | What it does |
 |-------|--------|--------------|
 | **1. Attack** | [`quantum/`](quantum/) | Shor's and Grover's algorithms in **Qiskit**, run on a quantum simulator. At simulator scale Shor factors a small number and reconstructs a toy RSA key — an educational demonstration of *why* RSA/ECC are rated HIGH (not a break of real key sizes). |
-| **2. Detection** | [`cli/`](cli/) | A hybrid **AST + regex** static-analysis engine over 11 languages, with cross-language usage-awareness, **dependency + lockfile scanning**, **reachability ranking**, and **call-site-specific fixes**, that scores risk and produces a NIST-aligned migration plan. **100% precision on the labeled [benchmark](benchmark/)** (18 files) and **100% recall on 50 seeded cases** — see [methodology](benchmark/RESULTS.md). |
+| **2. Detection** | [`cli/`](cli/) | A hybrid **AST + regex** static-analysis engine over 11 languages, with cross-language usage-awareness, **dependency + lockfile scanning**, **reachability ranking**, and **call-site-specific fixes**, that scores risk and produces a NIST-aligned migration plan. **100% precision on the labeled [benchmark](benchmark/)** (18 files), **100% recall on 50 seeded cases**, and **93% precision (95% CI 86–97%) on a random, hand-labeled sample of 100 findings in real PyPI packages** — see [methodology](benchmark/RESULTS.md) and [real-code precision](benchmark/RESULTS-precision.md). |
 | **3. Fix** | [`pqc/`](pqc/) | A from-scratch **lattice (LWE) key-encapsulation mechanism** — the math behind CRYSTALS-Kyber / ML-KEM — so the recommended fix is runnable and provable. |
 
 The detection layer ships through three surfaces that share **one** engine:
@@ -178,6 +178,239 @@ score = min(100, 15*HIGH + 5*MEDIUM + 1*LOW)
 
 ---
 
+## Scanning a live website (`--url`)
+
+A website's quantum exposure is not in its source code — it is in the TLS
+handshake, and almost all of it sits in two brief public-key steps:
+
+- the **key exchange**, which Shor's algorithm breaks to recover the session
+  key. This is harvest-now-decrypt-later: traffic recorded today becomes
+  readable when a quantum computer exists, so it is *retroactive* and cannot be
+  fixed afterwards.
+- the **certificate signature**, which Shor also breaks — but only to forge
+  *future* certificates, and those rotate every ~90 days anyway.
+
+Symmetric cryptography is not the problem: Grover's algorithm square-roots a
+brute-force search, so AES-128 drops to ~2⁶⁴ work and AES-256 is comfortable.
+
+```bash
+quantumsafe scan --url github.com
+```
+
+```
+TLS handshake  github.com:443  (140.82.112.4)
+  Key exchange   : X25519 (classical)
+  Protocol       : TLSv1.3
+  Cipher         : TLS_AES_128_GCM_SHA256 (128-bit symmetric)
+  Certificate    : github.com issued by Sectigo Limited, expires Nov 29 2026
+```
+
+| Host | Key exchange | |
+|---|---|---|
+| `cloudflare.com` | `X25519MLKEM768` | post-quantum |
+| `google.com` | `X25519MLKEM768` | post-quantum |
+| `github.com` | `X25519` | classical |
+
+**Why this needs a hand-built ClientHello.** In TLS 1.2 the cipher suite named
+the key exchange (`ECDHE_RSA_WITH_AES_128_GCM_SHA256`). TLS 1.3 removed it —
+every modern site reports only `TLS_AES_128_GCM_SHA256`, which says nothing
+about key exchange. The group lives in the `key_share` extension, and Python's
+`ssl` cannot read it: `SSLContext.set_groups` and `SSLObject.group_used` need
+OpenSSL 3.5+ and Python 3.14, and ML-KEM groups need OpenSSL 3.5 at all. On
+OpenSSL 3.0 the most important fact about the connection is invisible.
+
+So the scanner speaks the handshake directly: it offers the hybrid groups in
+`supported_groups` but a `key_share` for X25519 only. A server preferring a
+hybrid must then reply with a HelloRetryRequest naming it (RFC 8446 §4.1.3).
+The server states its choice, and no ML-KEM implementation is needed to ask.
+No new dependencies.
+
+**What it measures.** The group the server *selects from what we offer* — the
+same answer a browser offering that set would get. Not proof of everything the
+server could support, which is why findings say "negotiated", not "supports".
+
+### The whole certificate chain, not just the leaf
+
+A chain is only as strong as its weakest signature, and the weak link is
+usually not the server certificate. Real output:
+
+```
+Certificate chain (a chain is only as strong as its weakest signature)
+  leaf          sig=ECDSA with SHA-256     key=EC P-256
+  intermediate  sig=ECDSA with SHA-384     key=EC P-256
+  intermediate  sig=SHA-256 with RSA       key=EC P-384
+  root          sig=SHA-1 with RSA         key=RSA-2048  (trust-store anchored)
+```
+
+Cloudflare's leaf is modern ECDSA — but an intermediate above it is signed
+**SHA-256 with RSA**. Forging that signature mints a leaf for any name under
+it, and a checker that reads only the server certificate reports "ECDSA,
+modern" and never sees it.
+
+Two deliberate distinctions:
+
+- **Certificate signatures are a forgery risk, not a retroactive one.** Shor
+  breaks them, but that forges *future* certificates — it does not decrypt
+  traffic already recorded, and certificates rotate every ~90 days, so this
+  largely follows the CA ecosystem's own migration. The key exchange above is
+  the urgent one. The findings say so rather than implying equal urgency.
+- **A root's own signature is not a finding.** A root is trusted because it is
+  in the client's trust store, not because of its self-signature, so forging
+  that signature gains an attacker nothing. Roots are shown for completeness
+  and excluded from the score — otherwise every chain carries an unactionable
+  HIGH, as the SHA-1 root above would.
+
+The signature algorithm and public key are the only two certificate fields
+that matter here, and they are the two `ssl.getpeercert()` does not return.
+Rather than take on `cryptography` as a runtime dependency, the handful of
+fields needed are walked out of the DER directly — a minimal tag-length-value
+reader that parses structure and OIDs and verifies nothing, since `ssl` has
+already validated the chain by the time it arrives.
+
+### The origins a page actually depends on (`--origins`)
+
+A site can negotiate a hybrid on its own domain and still pull scripts, fonts
+and analytics from a dozen other origins over classical key exchange — and the
+author chose every one of them.
+
+```bash
+quantumsafe scan --url github.com --origins
+```
+
+```
+Third-party origins  2 post-quantum, 3 classical  of 5 scanned
+  github.githubassets.com              X25519
+  avatars.githubusercontent.com        X25519
+  github-cloud.s3.amazonaws.com        X25519MLKEM768
+  user-images.githubusercontent.com    X25519
+  images.ctfassets.net                 X25519MLKEM768
+```
+
+One aggregate finding, not one per origin — a dozen separate HIGHs for other
+people's servers would bury the findings you can act on. It is MEDIUM rather
+than HIGH when your own key exchange is fine, because a third-party server is
+not yours to fix: the action is to drop the dependency or press the vendor.
+
+**A page is attacker-controlled input**, so the SSRF guard runs on every
+*discovered* origin, not once on the entry URL. Anyone can publish markup whose
+script tags point at `169.254.169.254`, and a sweep that followed what it found
+would be an SSRF with extra steps. The page read, the origin count and each
+handshake are all bounded.
+
+**Scanning someone else's server.** This is exactly one TLS handshake, which is
+what a browser does on every visit: passive and non-intrusive. It is not port
+scanning or vulnerability probing, and stays that way deliberately. The target
+must resolve *entirely* to public addresses on port 443/8443, and the
+connection goes to the address that was checked — private ranges, loopback,
+link-local (including cloud metadata at `169.254.169.254`), carrier-grade NAT
+and IPv4-mapped IPv6 forms of all of those are refused.
+
+---
+
+## Scan diffing: a ratchet for CI
+
+A single scan is a snapshot, and a snapshot is a poor gate. A repository with
+forty known findings cannot adopt `--fail-on-high` without failing every build
+from day one — so in practice the check gets removed and nothing is enforced.
+What a team *can* adopt is a ratchet: tolerate the backlog, fail only when it
+grows.
+
+```bash
+quantumsafe scan --path . --output baseline.json     # once, committed
+quantumsafe scan --path . --baseline baseline.json --fail-on-new
+```
+
+```
+Since baseline  REGRESSED
+  0 fixed   2 new   19 unchanged   score 100 -> 100 (+0)
+  NEW   newly_added.py:1  DSA [HIGH]
+  NEW   newly_added.py:2  DSA [HIGH]
+```
+
+| | exit code |
+|---|---|
+| regression, `--fail-on-new` | **1** |
+| no regression, `--fail-on-new` | **0** — the 19-finding backlog is tolerated |
+| same scan, `--fail-on-high` | **1** — fails on the backlog |
+
+Note `score 100 -> 100 (+0)` above. The risk score caps at 100, so a codebase
+already at the cap can acquire new HIGH findings with the number unmoved. The
+verdict is therefore driven by new findings, never by the score delta — a
+score-driven gate would have waved that DSA file straight through.
+
+**Findings are identified without their line number.** Line numbers move when
+an import is added or a file is reformatted, and keying on them turns a no-op
+edit into one "fixed" plus one "new". A diff that cries wolf gets ignored,
+which is worse than no diff. Identity is `(file_path, family, algorithm)`, and
+because several findings of one kind can share a key, counts are tracked per
+key: three RSA call sites in a file becoming five is two new findings.
+
+**What a diff cannot tell you**, and says so in its output: a finding that is
+gone was not necessarily fixed — the file may have been deleted, excluded or
+renamed, and a rename appears as one fixed plus one new.
+
+Two saved scans can also be compared through the dashboard:
+
+```http
+GET /api/v1/scans/{id}/diff?against={other_id}   (JWT)
+```
+
+Both scans are looked up scoped to the caller, so one account cannot diff
+against another's history; omit `against` to compare with the previous scan.
+
+---
+
+## Migration horizon (Mosca's inequality)
+
+The risk score says *how much* vulnerable cryptography you have. It cannot say
+whether you will finish migrating in time, which is the question the threat
+model actually poses. One RSA key exchange protecting data that must stay
+secret for fifty years is worse than forty MD5 checksums.
+
+Michele Mosca's formulation:
+
+```
+X  how long the data must stay confidential
+Y  how long the migration takes
+Z  how long until a quantum computer can break it
+
+X + Y > Z   ->   data sent today is already exposed
+```
+
+The reason is harvest-now-decrypt-later: an adversary records ciphertext today
+and decrypts it when Z arrives. Migration has to *finish* by `Z - X`, not at Z.
+
+```bash
+quantumsafe scan --path . --secrecy-years 10 --crqc-years 12
+```
+
+```
+Migration horizon (Mosca's inequality)
+  Data must stay confidential (X) : 10 years
+  Estimated migration (Y)         : 2.77-8.66 years
+  Assumed quantum threat (Z)      : 12 years
+  Break-even year                 : 2038-2044
+  ALREADY LATE  Already too late: even on the optimistic estimate, data sent
+  today that must stay confidential for this long will still be sensitive when
+  the migration finishes.
+  Design changes needed           : dsa, ecc, rsa
+```
+
+**What this will not claim.** Z is unknowable, so there is no default for it —
+`--crqc-years` is yours to choose, and omitting it gives no verdict rather than
+a guess. What is always computed is the **break-even year**: the latest a
+quantum computer could arrive while still leaving time to migrate. That is a
+property of your code and your data, not a forecast.
+
+Y is an engineering estimate, so it is reported as a range, counted per
+cryptographic *family* rather than per call site (five hundred RSA call sites
+are not five hundred migrations), and every coefficient is printed in the JSON
+report under `horizon.assumptions` so you can disagree with a specific number
+rather than with the whole figure. Replace them with measurements from your own
+migration if you have them — that is strictly better.
+
+---
+
 ## Evaluation (does the detector actually work?)
 
 The scanner is measured against a labeled [benchmark](benchmark/) of 18 files
@@ -226,7 +459,7 @@ badge from an actual scan — in [docs/EXAMPLES.md](docs/EXAMPLES.md).
 
 ### Real-world scan: paramiko (the SSH library)
 
-Run against a shallow clone of [`paramiko/paramiko`](https://github.com/paramiko/paramiko)
+Run in July 2026 against a shallow clone of [`paramiko/paramiko`](https://github.com/paramiko/paramiko)
 — the SSH implementation behind Ansible, Fabric, and much of the Python ecosystem.
 SSH key exchange leans on RSA, ECDSA, and Diffie-Hellman, all broken by Shor's
 algorithm, which makes it a textbook "harvest now, decrypt later" target:
@@ -264,9 +497,10 @@ python benchmark/realworld.py
 |---|---|
 | Packages scanned | **37** |
 | Packages with ≥1 finding | **32 (86%)** |
-| Python files analyzed | **10,938** |
-| Total findings | **5,512** — **4,083 HIGH-risk** |
-| Most common families | `ecc` ×1,709, `sha256` ×956, `rsa` ×770, `sha1` ×576, `dsa` ×355, `md5` ×351 |
+| Python files analyzed | **11,275** |
+| Total findings | **5,609** — **4,236 HIGH-risk** |
+| Most common families | `ecc` ×1,831, `sha256` ×1,013, `rsa` ×796, `sha1` ×577, `md5` ×359, `dsa` ×353 |
+| Run | 2026-10-28, scanner 0.3.1 (latest release of each package) |
 
 Every finding is a concrete `file:line` an auditor can open — e.g. Diffie-Hellman
 in `twisted/conch/ssh/transport.py`, MD5 in `requests/auth.py` (HTTP Digest), and
@@ -380,12 +614,18 @@ quantumsafe version
 |------|-------------|
 | `--path` | Local directory or file to scan |
 | `--repo` | Public `https://github.com/<org>/<repo>` URL |
+| `--url` | Live HTTPS host — scans the TLS handshake and certificate chain |
+| `--origins` | With `--url`, also scan every third-party origin the page loads from |
 | `--output` | Write to `.json`, `.cbom.json` (CycloneDX CBOM), `.html`, `.sarif`, or `.svg` (risk badge); terminal summary still printed |
 | `--exclude` | Glob of paths to skip (repeatable) |
 | `--taint` | Also run interprocedural data-flow analysis (Python): flag quantum-vulnerable crypto reached through wrapper functions, **across files** (whole-program call graph with import resolution), not just direct calls |
 | `--no-deps` | Skip dependency scanning (on by default): parses manifests **and lockfiles** (`requirements.txt`, `pyproject.toml`, `package.json`, `go.mod`, `pom.xml`, `Gemfile`, `package-lock.json`, `poetry.lock`, `Pipfile.lock`, `Gemfile.lock`, `yarn.lock`, `go.sum`) and flags known quantum-vulnerable crypto libraries (with purl + direct/transitive scope) in the CBOM |
 | `--no-rank` | Skip reachability ranking (on by default): labels each source finding `reachable` / `test-example` / `unreferenced` so exploitable findings sort above dead or example code |
 | `--fail-on-high` | Exit non-zero on any HIGH finding (CI gate) |
+| `--baseline` | Compare against a saved JSON report: fixed / new / unchanged |
+| `--fail-on-new` | With `--baseline`, exit non-zero only on NEW findings (the ratchet) |
+| `--secrecy-years` | How long the data must stay confidential — enables the migration horizon |
+| `--crqc-years` | The quantum-threat year you want to reason about (no default: nobody knows it) |
 | `--no-sync` | Don't upload the result to your linked dashboard |
 
 After `quantumsafe auth --key <key> --api-url <your-api>`, every `quantumsafe scan`
@@ -421,6 +661,12 @@ jobs:
           exclude: tests/*,vendor/*
           fail-on-high: "true"   # fail the build on any HIGH finding
 
+          # Or ratchet instead of gating on absolutes: tolerate the existing
+          # backlog and fail only when it grows. A missing baseline warns and
+          # skips the comparison, so the first run still works.
+          # baseline: quantumsafe-baseline.json
+          # fail-on-new: "true"
+
       - uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: quantumsafe.sarif
@@ -433,7 +679,7 @@ jobs:
 | `output` | `quantumsafe.sarif` | Where to write the SARIF report |
 | `exclude` | *(none)* | Comma-separated globs to skip |
 | `fail-on-high` | `"false"` | Exit non-zero if any HIGH finding is present |
-| `version` | *(latest)* | Pin `quantumsafe-scan`, e.g. `0.2.0` |
+| `version` | *(latest)* | Pin `quantumsafe-scan`, e.g. `0.3.1` |
 
 Pin to a released tag rather than `@main` once one exists — `@main` moves under
 you, which is the same class of problem as an unpinned linter.
@@ -470,10 +716,19 @@ POST /api/v1/scan/import        (X-API-Key)   # used by the CLI to upload result
 POST /api/v1/demo-scan          (public, rate-limited)  # landing-page live demo
      { "code": "..." } -> { report }   # runs the real engine, stores nothing
 
+POST /api/v1/scan-url           (public, 10/hour)   # live TLS endpoint scan
+     { "url": "example.com" } -> { report }   # one handshake, stores nothing
+
+POST /api/v1/horizon            (public, 120/hour)  # Mosca's inequality
+     { "findings": [{"family": "rsa"}], "secrecy_years": 10 } -> { horizon }
+     # only the family is read; the dashboard fetches Y once and moves its
+     # sliders locally, since X + Y > Z is arithmetic
+
 GET  /api/v1/scans?page=1&per_page=20   (JWT)  -> paginated list
 GET  /api/v1/scans/{id}                 (JWT)  -> scan + findings
 GET  /api/v1/scans/{id}/export?format=json|html|csv|sarif|cbom|svg   (JWT)
 GET  /api/v1/scans/{id}/migration       (JWT)  -> grouped migration plan
+GET  /api/v1/scans/{id}/diff?against={id}  (JWT)  -> fixed / new / unchanged
 GET  /api/v1/overview                   (JWT)  -> dashboard stats + trend
 ```
 
@@ -525,7 +780,7 @@ window.QUANTUMSAFE_API = "https://quantumsafe-api.onrender.com";
 Requires Python 3.9+.
 
 ```bash
-git clone https://github.com/Danny-397/Quantum-Safe
+git clone https://github.com/Danny-397/Quantum-Safe-Scan
 cd Quantum-Safe
 
 # 1) Install the shared scanner package (CLI) in editable mode
@@ -557,7 +812,7 @@ docker compose up --build
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q                     # 80 tests; in-memory DB, no setup
+pytest -q                     # 559 tests; in-memory DB, no setup
 ```
 
 Seed a demo account so the dashboard is populated:
@@ -592,7 +847,7 @@ See [`.env.example`](.env.example).
 
 ## Deployment
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Danny-397/Quantum-Safe)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Danny-397/Quantum-Safe-Scan)
 
 See **[DEPLOYMENT.md](DEPLOYMENT.md)** for the full walkthrough. In short:
 

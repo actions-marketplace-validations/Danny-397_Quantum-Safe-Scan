@@ -150,6 +150,24 @@ def remediate(family: str, language: str = "", snippet: str = "") -> Fix:
             drop_in=True,
             guidance="For very long-lived data you may prefer SHA-384/512 or SHA3.",
         )
+    if family == "pqc_hybrid":
+        return Fix(
+            action="No change required — post-quantum hybrid key exchange is "
+                   "already in use.",
+            drop_in=True,
+            guidance="The session secret is derived from ML-KEM alongside a "
+                     "classical curve, so recovering it needs both broken. "
+                     "Keep the classical half: hybrid is what protects you if a "
+                     "weakness is found in the PQC scheme itself.",
+        )
+    if family == "pqc_signature":
+        return Fix(
+            action="No change required — a post-quantum signature scheme is "
+                   "already in use.",
+            drop_in=True,
+            guidance="ML-DSA (FIPS 204) is not broken by Shor's algorithm, so "
+                     "the signature cannot be forged by a quantum attacker.",
+        )
     if family in _ASYM:
         target, role = _ASYM[family]
         return Fix(

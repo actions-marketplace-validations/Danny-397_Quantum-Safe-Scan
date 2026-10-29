@@ -12,13 +12,21 @@ import os
 from flask import Flask, jsonify
 from flask_cors import CORS
 
-from config import Config
+from config import DEV_SECRET, Config
 from extensions import db, jwt, limiter, mail
 
 
 def create_app(config_object: type = Config) -> Flask:
     app = Flask(__name__)
     app.config.from_object(config_object)
+
+    # The default secret is public (it is in this file's repository), so tokens
+    # signed with it can be forged by anyone. render.yaml generates real ones,
+    # but a service created by hand would silently fall back -- refuse to start
+    # on Render instead. (RENDER is set on every Render instance.)
+    if os.environ.get("RENDER") and DEV_SECRET in (app.config["SECRET_KEY"],
+                                                    app.config["JWT_SECRET_KEY"]):
+        raise RuntimeError("SECRET_KEY / JWT_SECRET_KEY must be set in production.")
 
     # Extensions
     db.init_app(app)
@@ -27,10 +35,19 @@ def create_app(config_object: type = Config) -> Flask:
     limiter.init_app(app)
     app.config["RATELIMIT_STORAGE_URI"] = app.config.get("RATELIMIT_STORAGE_URI", "memory://")
 
-    # CORS restricted to the dashboard origin(s) only, for the API surface.
+    # CORS restricted to the dashboard origin(s) only.
+    #
+    # /health is covered alongside /api/*: the dashboard pre-warms the Render
+    # instance by fetching it on page load, and with only /api/* in the map
+    # that fetch was blocked by CORS on every visit. The ping never landed, so
+    # the cold start it exists to absorb was paid by the user's first real
+    # scan instead (~23s).
     CORS(
         app,
-        resources={r"/api/*": {"origins": app.config["CORS_ORIGINS"]}},
+        resources={
+            r"/api/*": {"origins": app.config["CORS_ORIGINS"]},
+            r"/health": {"origins": app.config["CORS_ORIGINS"]},
+        },
         supports_credentials=True,
     )
 
@@ -54,6 +71,10 @@ def create_app(config_object: type = Config) -> Flask:
     @app.errorhandler(404)
     def not_found(_e):
         return jsonify({"error": "Not found."}), 404
+
+    @app.errorhandler(413)
+    def too_large(_e):
+        return jsonify({"error": "Upload exceeds the 25 MB limit."}), 413
 
     @app.errorhandler(429)
     def ratelimited(_e):

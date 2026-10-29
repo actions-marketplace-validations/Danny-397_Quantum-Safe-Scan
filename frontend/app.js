@@ -121,7 +121,12 @@
     try { data = await res.json(); } catch (_) { /* non-JSON */ }
     if (!res.ok) {
       const msg = (data && data.error) || `Request failed (${res.status})`;
-      throw new Error(msg);
+      const err = new Error(msg);
+      // Carry the status so a caller can tell a deliberate refusal (400 --
+      // retrying changes nothing) from a cold backend (worth one retry).
+      // Existing callers read only .message and are unaffected.
+      err.status = res.status;
+      throw err;
     }
     return data;
   }
@@ -194,7 +199,7 @@
         // Drop the stagger delay once revealed so it doesn't lag later hover
         // transitions (transition-delay applies to every transition on the node).
         const d = parseFloat(el.style.transitionDelay) || 0;
-        if (d) setTimeout(() => { el.style.transitionDelay = ""; }, 800 + d);
+        if (d) setTimeout(() => { el.style.transitionDelay = ""; }, 500 + d);
       });
     }, { threshold: 0.12, rootMargin: "0px 0px -6% 0px" });
 
@@ -205,13 +210,14 @@
       io.observe(el);
     };
 
-    // Staggered groups — children rise one after another.
-    document.querySelectorAll(".hero-copy, .steps, .detect, .pillars, .grid").forEach((group) => {
-      Array.from(group.children).forEach((child, i) => mark(child, Math.min(i, 6) * 70));
+    // Staggered groups — children rise one after another. The hero copy is
+    // deliberately not here: the first screen paints at once, not on a delay.
+    document.querySelectorAll(".steps, .detect, .pillars, .grid").forEach((group) => {
+      Array.from(group.children).forEach((child, i) => mark(child, Math.min(i, 4) * 50));
     });
 
     // Individual reveals across the marketing and app pages.
-    const singles = ".section-head, .hero-visual, .ci-block, .cta-band, .score-cycle," +
+    const singles = ".section-head, .ci-block, .cta-band, .score-cycle," +
       " .card, .auth-card, .mig-item, .save-banner," +
       " .legal h1, .legal h2, .legal p, .legal ul, .page-head";
     document.querySelectorAll(singles).forEach((el) => mark(el));
@@ -245,7 +251,9 @@
     }
 
     initDemoScanner();
+    initScanTabs();
     initHomeScan();
+    initUrlScan();
     initScoreCycle();
   }
 
@@ -578,6 +586,128 @@
     }
   }
 
+  // ---- Live TLS scan (scan a website) ----
+  //
+  // Posts to /api/v1/scan-url, which performs one TLS handshake and reports
+  // the key exchange, protocol, cipher and the whole certificate chain. The
+  // SSRF guard lives server-side; a refusal comes back as a 400 with the
+  // reason, which is shown verbatim rather than replaced with a generic error.
+  function paintTlsResult(report) {
+    const box = $("#url-scan-result");
+    if (!box) return;
+    const e = report.endpoint || {};
+    const pq = !!e.key_exchange_post_quantum;
+    const kexClass = pq ? "tls-kex-pq" : "tls-kex-classical";
+    const kexNote = pq ? "post-quantum hybrid" : "classical";
+
+    const rows = [
+      ["Key exchange", `<span class="${kexClass}">${esc(e.key_exchange || "?")}</span>
+         <span class="muted">(${kexNote})</span>`],
+      ["Protocol", esc(e.protocol || "unknown")],
+      ["Cipher", `${esc(e.cipher || "unknown")}
+         <span class="muted">(${esc(String(e.symmetric_bits || "?"))}-bit symmetric)</span>`],
+    ];
+    const cert = e.certificate || {};
+    if (cert.issuer) {
+      rows.push(["Certificate", `${esc(cert.subject || "(see SAN)")}
+        <span class="muted">issued by ${esc(cert.issuer)}, expires
+        ${esc(cert.not_after || "unknown")}</span>`]);
+    }
+
+    let html = rows.map(([k, v]) =>
+      `<div class="tls-row"><span class="k">${k}</span><span>${v}</span></div>`).join("");
+
+    const chain = e.chain || [];
+    if (chain.length) {
+      html += `<div class="tls-chain">
+        <div class="tls-verdict"><b>Certificate chain</b>
+          <span class="muted">— a chain is only as strong as its weakest signature</span></div>` +
+        chain.map((c) => {
+          if (c.error) {
+            return `<div class="tls-chain-row"><span class="role">${esc(c.role)}</span>
+              <span class="muted">unparseable</span></div>`;
+          }
+          let key = c.key_algorithm || "?";
+          if (c.key_curve) key += " " + c.key_curve;
+          else if (c.key_bits) key += "-" + c.key_bits;
+          const isRoot = (c.role || "").indexOf("root") === 0;
+          const note = isRoot
+            ? ' <span class="muted">(trust-store anchored)</span>' : "";
+          return `<div class="tls-chain-row${isRoot ? " is-root" : ""}">
+            <span class="role">${esc(c.role)}</span>
+            <span>sig=${esc(c.signature || "?")}</span>
+            <span>key=${esc(key)}</span>${note}</div>`;
+        }).join("") + `</div>`;
+    }
+
+    const s = report.summary || {};
+    html += `<div class="tls-verdict">
+      <b>Risk ${report.risk_score}/100 (${esc(report.risk_band || "")})</b>
+      <span class="muted">— ${s.high || 0} high, ${s.medium || 0} medium,
+      ${s.low || 0} low</span></div>`;
+
+    box.innerHTML = html;
+    box.hidden = false;
+  }
+
+  async function runUrlScan() {
+    const input = $("#url-scan-input");
+    const msg = $("#url-scan-msg");
+    const btn = $("#url-scan-run");
+    if (!input) return;
+    const target = input.value.trim();
+    if (!target) {
+      if (msg) msg.textContent = "Enter a website, e.g. example.com";
+      return;
+    }
+    setLoading(btn, true, "Scanning");
+    if (msg) msg.textContent = "Opening one TLS handshake…";
+    const call = () => api("/api/v1/scan-url", {
+      noAuth: true, noRedirect: true, json: { url: target },
+    });
+    try {
+      let d;
+      try {
+        d = await call();
+      } catch (err) {
+        // A 400 is the server refusing the target on purpose -- show that
+        // reason rather than retrying, which would not change the answer.
+        if (err && err.status === 400) throw err;
+        if (msg) msg.textContent = "Engine waking up — retrying…";
+        await new Promise((r) => setTimeout(r, 4000));
+        d = await call();
+      }
+      paintTlsResult(d.report);
+      if (msg) msg.textContent = "";
+    } catch (err) {
+      const box = $("#url-scan-result");
+      if (box) box.hidden = true;
+      if (msg) {
+        msg.textContent = (err && err.message)
+          ? err.message
+          : "Could not scan that host right now.";
+      }
+    } finally {
+      setLoading(btn, false);
+    }
+  }
+
+  function initUrlScan() {
+    const input = $("#url-scan-input");
+    if (!input) return;
+    const run = $("#url-scan-run");
+    if (run) run.addEventListener("click", runUrlScan);
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); runUrlScan(); }
+    });
+    $$(".url-chip").forEach((chip) => {
+      chip.addEventListener("click", () => {
+        input.value = chip.dataset.host || "";
+        runUrlScan();
+      });
+    });
+  }
+
   function initDemoScanner() {
     const input = $("#demo-input");
     if (!input) return;
@@ -587,25 +717,53 @@
     if (sample) sample.addEventListener("click", () => { input.value = DEMO_SAMPLE; renderDemo(); });
     const run = $("#demo-run");
     if (run) run.addEventListener("click", runRealDemo);
-    // Value-first: any "Scan free" / hero CTA drops the cursor into the editor
-    // once the anchor has scrolled the demo into view.
-    $$('a[href="#scan"]').forEach((a) =>
-      a.addEventListener("click", () => setTimeout(() => input.focus({ preventScroll: true }), 350)));
     renderDemo();
   }
 
-  // ---- Cookie / storage notice (all pages) ----
-  function ensureCookieNotice() {
-    if (localStorage.getItem("qs_cookie_ack") === "1") return;
-    const bar = document.createElement("div");
-    bar.className = "cookie-banner";
-    bar.innerHTML =
-      'We use strictly-necessary local storage to keep you signed in. ' +
-      'See our <a href="privacy.html">Privacy Policy</a>. ' +
-      '<button class="btn btn-sm btn-primary" id="cookie-ok">Got it</button>';
-    document.body.appendChild(bar);
-    const ok = bar.querySelector("#cookie-ok");
-    ok.addEventListener("click", () => { localStorage.setItem("qs_cookie_ack", "1"); bar.remove(); });
+  // ---- Scanner tabs: Codebase / Website / Snippet ----
+  // ARIA tabs pattern: arrows move between tabs, one tab stop. A link to a
+  // panel id (#scan-repo, #scan-url, #scan-paste) opens that tab, and any
+  // "Scan free" CTA drops the cursor into the open tab's input.
+  function initScanTabs() {
+    const tabs = $$(".scan-tab");
+    if (!tabs.length) return;
+    const FOCUS = { "scan-repo": "#home-scan-repo", "scan-url": "#url-scan-input", "scan-paste": "#demo-input" };
+
+    function select(tab, focusTab) {
+      tabs.forEach((t) => {
+        const on = t === tab;
+        t.setAttribute("aria-selected", String(on));
+        t.tabIndex = on ? 0 : -1;
+        $("#" + t.getAttribute("aria-controls")).hidden = !on;
+      });
+      if (focusTab) tab.focus();
+    }
+    const tabFor = (panelId) => tabs.find((t) => t.getAttribute("aria-controls") === panelId);
+
+    tabs.forEach((t, i) => {
+      t.addEventListener("click", () => select(t));
+      t.addEventListener("keydown", (e) => {
+        const step = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
+        if (step) { e.preventDefault(); select(tabs[(i + step + tabs.length) % tabs.length], true); }
+        else if (e.key === "Home") { e.preventDefault(); select(tabs[0], true); }
+        else if (e.key === "End") { e.preventDefault(); select(tabs[tabs.length - 1], true); }
+      });
+    });
+
+    function openFromHash() {
+      const tab = tabFor((location.hash || "").slice(1));
+      if (tab) select(tab);
+    }
+    window.addEventListener("hashchange", openFromHash);
+    openFromHash();
+
+    $$('a[href^="#scan"]').forEach((a) => a.addEventListener("click", () => {
+      const tab = tabFor(a.getAttribute("href").slice(1));
+      if (tab) select(tab);
+      const open = tabs.find((t) => t.getAttribute("aria-selected") === "true");
+      const field = open && $(FOCUS[open.getAttribute("aria-controls")]);
+      if (field) setTimeout(() => field.focus({ preventScroll: true }), 350);
+    }));
   }
 
   // =========================================================================
@@ -1001,6 +1159,21 @@
       { after: 30000, text: "Still going — larger repos take a little longer…" },
       { after: 75000, text: "Taking unusually long. If this doesn't finish, the snippet scanner on the home page runs in your browser and always works." },
     ]);
+    // Confirm the host is up before committing to the long scan request. A cold
+    // start answers /health within about a minute; a host that is down never
+    // answers at all, and without this check the visitor waits out the full
+    // scan ceiling below before learning that.
+    try {
+      await api("/health", { noAuth: true, noRedirect: true, timeoutMs: 70000 });
+    } catch (_) {
+      stopProgress();
+      showMsg(msgEl,
+        "The hosted repo scanner is offline right now. The snippet scanner on the home page" +
+        " runs entirely in your browser and still works, and the full scanner runs locally:" +
+        " pip install quantumsafe-scan");
+      setLoading(btn, false);
+      return;
+    }
     try {
       let res;
       // A real scan is synchronous and can legitimately run for minutes: a cold
@@ -1036,6 +1209,100 @@
       msgEl: $("#scan-msg"),
       btn: $("#btn-run-scan"),
     });
+  }
+
+
+  // ---- Migration horizon (Mosca's inequality) ----
+  //
+  // Y -- how long the migration takes -- is estimated from the findings by the
+  // server, so the effort model stays single-sourced with the CLI. It is
+  // fetched ONCE. The sliders then recompute the verdict here, because
+  // X + Y > Z is arithmetic and a round trip per drag would make the control
+  // unusable. The comparison below is deliberately the only logic duplicated.
+  let hzY = null;   // { low, high } years, from /api/v1/horizon
+
+  function hzRender() {
+    const card = $("#hz-card");
+    if (!card || !hzY) return;
+    const X = parseFloat($("#hz-secrecy").value);
+    const Z = parseFloat($("#hz-crqc").value);
+    const label = $("#hz-crqc-label");
+    if (label) label.textContent = String(Z);
+
+    const beLow = X + hzY.low;
+    const beHigh = X + hzY.high;
+    const thisYear = new Date().getFullYear();
+
+    let verdict, cls, message;
+    if (hzY.low === 0 && hzY.high === 0) {
+      verdict = "NOTHING TO MIGRATE";
+      cls = "hz-ok";
+      message = "No quantum-vulnerable cryptography was found, so the inequality " +
+                "does not apply. This says nothing about cryptography the scanner " +
+                "cannot see.";
+    } else if (beLow > Z) {
+      verdict = "ALREADY TOO LATE";
+      cls = "hz-late";
+      message = "Even on the optimistic estimate, data sent today that must stay " +
+                "confidential this long will still be sensitive when the migration " +
+                "finishes.";
+    } else if (beHigh > Z) {
+      verdict = "AT RISK";
+      cls = "hz-risk";
+      message = "The optimistic estimate finishes in time; the pessimistic one does " +
+                "not. The margin rests on assumptions you should replace with your own.";
+    } else {
+      verdict = "ON TRACK";
+      cls = "hz-ok";
+      message = "The migration finishes with room to spare even on the pessimistic " +
+                "estimate, for this choice of Z.";
+    }
+
+    const v = $("#hz-verdict");
+    if (v) {
+      v.className = "hz-verdict " + cls;
+      v.innerHTML = `<b>${verdict}</b> <span>${esc(message)}</span>`;
+    }
+    const d = $("#hz-detail");
+    if (d) {
+      const beYears = beLow.toFixed(1) === beHigh.toFixed(1)
+        ? `${beLow.toFixed(1)}`
+        : `${beLow.toFixed(1)}\u2013${beHigh.toFixed(1)}`;
+      const beYear = Math.floor(beLow) === Math.floor(beHigh)
+        ? `${thisYear + Math.floor(beLow)}`
+        : `${thisYear + Math.floor(beLow)}\u2013${thisYear + Math.floor(beHigh)}`;
+      d.innerHTML =
+        `X = ${X}y &nbsp;+&nbsp; Y = ${hzY.low}\u2013${hzY.high}y ` +
+        `&nbsp;&rarr;&nbsp; migration must be done within <b>${beYears} years</b> ` +
+        `(break-even <b>${beYear}</b>) &nbsp;vs&nbsp; Z = ${Z}y`;
+    }
+  }
+
+  async function initHorizon(findings) {
+    const card = $("#hz-card");
+    if (!card || !findings || !findings.length) return;
+    try {
+      const d = await api("/api/v1/horizon", {
+        noAuth: true, noRedirect: true,
+        json: {
+          // Only the family is needed, and only the family is sent.
+          findings: findings.map((f) => ({ family: f.family || "" })),
+          secrecy_years: 0,
+        },
+      });
+      const h = d.horizon;
+      hzY = h.migration_years;
+      const ul = $("#hz-assumptions");
+      if (ul) ul.innerHTML = (h.assumptions || [])
+        .map((a) => `<li>${esc(a)}</li>`).join("");
+      card.hidden = false;
+      $("#hz-secrecy").addEventListener("change", hzRender);
+      $("#hz-crqc").addEventListener("input", hzRender);
+      hzRender();
+    } catch (_) {
+      // The horizon is additive: if the backend is cold or gone, the findings
+      // table is still the point of this page, so the card simply stays hidden.
+    }
   }
 
   // =========================================================================
@@ -1096,13 +1363,70 @@
     $("#sd-med").textContent = scan.summary.medium;
     $("#sd-low").textContent = scan.summary.low;
     sdCache = scan.findings || [];
+    sdAlgo = null;
+    initHorizon(sdCache);
+    renderFixFirst(sdCache);
     renderSd();
     $("#sd-filter").onchange = renderSd;
   }
 
+  // "Fix these first": the findings table lists every call site, but the
+  // work is per algorithm. Group by algorithm, rank by risk then by how many
+  // places use it, and show the top three with their replacement. Clicking
+  // one narrows the table to that algorithm.
+  const RISK_RANK = { HIGH: 0, MEDIUM: 1, LOW: 2 };
+  let sdAlgo = null;
+
+  function renderFixFirst(findings) {
+    const card = $("#fix-first"), list = $("#fix-list");
+    if (!card || !list) return;
+    const groups = new Map();
+    for (const f of findings) {
+      if (f.risk_level === "LOW") continue;
+      const g = groups.get(f.algorithm) ||
+        { algo: f.algorithm, risk: f.risk_level, rec: f.recommendation, ref: f.nist_reference, n: 0, files: new Set() };
+      if (RISK_RANK[f.risk_level] < RISK_RANK[g.risk]) g.risk = f.risk_level;
+      g.n += 1;
+      g.files.add(f.file_path);
+      groups.set(f.algorithm, g);
+    }
+    const top = [...groups.values()]
+      .sort((a, b) => RISK_RANK[a.risk] - RISK_RANK[b.risk] || b.n - a.n || a.algo.localeCompare(b.algo))
+      .slice(0, 3);
+    card.hidden = false;
+    if (!top.length) {
+      list.innerHTML = `<li class="fix-none">Nothing urgent: no high- or medium-risk cryptography was found.</li>`;
+      return;
+    }
+    const places = (g) => `${g.n} place${g.n === 1 ? "" : "s"} in ${g.files.size} file${g.files.size === 1 ? "" : "s"}`;
+    list.innerHTML = top.map((g) => `
+      <li><button type="button" class="fix-item" data-algo="${esc(g.algo)}">
+        <span class="badge ${riskClass(g.risk)}">${esc(g.risk)}</span>
+        <span class="fix-main">
+          <span class="fix-title">Replace ${esc(g.algo)}</span>
+          <span class="fix-rec">${esc(g.rec)}${g.ref ? ` <span class="fix-ref">${esc(g.ref)}</span>` : ""}</span>
+        </span>
+        <span class="fix-count">${places(g)}</span>
+      </button></li>`).join("");
+    list.querySelectorAll(".fix-item").forEach((b) => b.addEventListener("click", () => {
+      sdAlgo = b.dataset.algo;
+      $("#sd-filter").value = "all";
+      renderSd();
+      $("#sd-findings").scrollIntoView({ behavior: "smooth", block: "start" });
+    }));
+  }
+
   function renderSd() {
     const lvl = $("#sd-filter").value;
-    const rows = sdCache.filter((f) => lvl === "all" || f.risk_level === lvl);
+    const rows = sdCache.filter((f) => (lvl === "all" || f.risk_level === lvl) &&
+                                       (!sdAlgo || f.algorithm === sdAlgo));
+    const chip = $("#sd-algo-filter");
+    if (chip) {
+      chip.hidden = !sdAlgo;
+      chip.innerHTML = sdAlgo ? `Showing ${esc(sdAlgo)} <button type="button" aria-label="Show all algorithms">&times;</button>` : "";
+      const x = chip.querySelector("button");
+      if (x) x.addEventListener("click", () => { sdAlgo = null; renderSd(); });
+    }
     const tb = $("#sd-body");
     tb.innerHTML = rows.length
       ? rows.map(findingRow).join("")
@@ -1239,7 +1563,8 @@
     else if (page === "dashboard.html") initDashboard();
     else if (page === "scan.html") initScanDetail();
     else if (page === "migration.html") initMigration();
-    // privacy.html / terms.html need no page init.
-    ensureCookieNotice();
+    // privacy.html / terms.html need no page init. There is no storage banner:
+    // the only storage is strictly necessary (sign-in token, current scan), so
+    // it is disclosed on the sign-in forms and in the privacy policy instead.
   });
 })();

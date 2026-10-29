@@ -7,7 +7,7 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%235b73e8'/><circle cx='7.3' cy='7.1' r='3.4' fill='none' stroke='white' stroke-width='1.4'/><path d='M8.7 8.5 11 10.8' stroke='white' stroke-width='1.5' stroke-linecap='round'/></svg>" />
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -59,6 +59,12 @@
             computer could break.</p>
         </div>
       </div>
+      <!-- The three most urgent things to change, grouped by algorithm (renderFixFirst) -->
+      <div class="card fix-first" id="fix-first" hidden>
+        <h3>Fix these first</h3>
+        <ol class="fix-list" id="fix-list"></ol>
+      </div>
+
       <div class="grid grid-3" style="margin-top:14px;">
         <div class="card"><h3>Target</h3><div class="mono" id="sd-target" style="word-break:break-all;font-size:13px;"></div></div>
         <div class="card"><h3>Date</h3><div class="mono" id="sd-date" style="font-size:14px;"></div></div>
@@ -71,13 +77,64 @@
         </div>
       </div>
 
-      <div class="card" style="margin-top:16px;">
+      <!-- Mosca's inequality: will the migration finish before the data matters? -->
+      <div class="card" id="hz-card" style="margin-top:16px;" hidden>
+        <h3>Migration horizon</h3>
+        <p class="muted" style="margin:4px 0 14px;font-size:13.5px;">
+          The score says <em>how much</em> vulnerable cryptography you have. It cannot say
+          whether you finish migrating in time. Mosca's inequality can:
+          <span class="mono">X + Y &gt; Z</span> means data sent today is already exposed,
+          because an adversary records it now and decrypts it once Z arrives.
+        </p>
+
+        <div class="hz-controls">
+          <label for="hz-secrecy">
+            <span>X &mdash; this data must stay confidential for</span>
+            <select id="hz-secrecy">
+              <option value="0.02">a session (days)</option>
+              <option value="1">1 year</option>
+              <option value="5">5 years</option>
+              <option value="10" selected>10 years</option>
+              <option value="25">25 years &mdash; financial records</option>
+              <option value="50">50 years &mdash; health records</option>
+              <option value="75">75 years &mdash; state secrets</option>
+            </select>
+          </label>
+          <label for="hz-crqc">
+            <span>Z &mdash; assume a quantum computer arrives in
+              <b class="mono" id="hz-crqc-label">15</b> years</span>
+            <input type="range" id="hz-crqc" min="1" max="40" step="1" value="15" />
+          </label>
+        </div>
+
+        <div id="hz-verdict" class="hz-verdict"></div>
+        <div id="hz-detail" class="hz-detail mono"></div>
+        <details class="method" style="margin-top:12px;">
+          <summary>What this refuses to claim</summary>
+          <div class="inner">
+            <p><b>Z is unknowable, so nothing here predicts it.</b> The slider is your
+              scenario, not a forecast. The figure that needs no guess is the
+              <b>break-even year</b>: the latest a quantum computer could arrive while
+              still leaving time to migrate. That is a property of your code and your
+              data, not of the future.</p>
+            <p><b>Y is an estimate</b>, so it is reported as a range. Effort is counted per
+              cryptographic family rather than per finding, because the expensive part is
+              the design decision and that is paid once; call sites then scale
+              sub-linearly. The coefficients are assumptions &mdash; listed below &mdash;
+              and figures from your own migration would be strictly better.</p>
+            <ul id="hz-assumptions"></ul>
+          </div>
+        </details>
+      </div>
+
+      <div class="card" id="sd-findings" style="margin-top:16px;">
         <div class="toolbar">
           <label class="muted" for="sd-filter" style="font-size:13px;">Filter risk</label>
           <select id="sd-filter">
             <option value="all">All</option><option value="HIGH">High</option>
             <option value="MEDIUM">Medium</option><option value="LOW">Low</option>
           </select>
+          <span class="algo-filter" id="sd-algo-filter" hidden></span>
           <div class="spacer"></div>
           <a class="btn btn-sm" id="sd-migration-link">View Migration Plan →</a>
         </div>

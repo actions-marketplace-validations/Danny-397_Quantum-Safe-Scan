@@ -21,8 +21,20 @@ _RISK_COLOR = {RISK_HIGH: "red", RISK_MEDIUM: "yellow", RISK_LOW: "green"}
 _BAND_COLOR = {"Low": "green", "Medium": "yellow", "High": "red", "Critical": "red"}
 
 
-def build_report(findings: list[Finding], target: str) -> dict:
-    """Assemble the canonical report structure from real findings."""
+def build_report(
+    findings: list[Finding],
+    target: str,
+    endpoint: dict | None = None,
+    secrecy_years: float | None = None,
+    crqc_years: float | None = None,
+) -> dict:
+    """Assemble the canonical report structure from real findings.
+
+    ``secrecy_years`` opts in to the Mosca's-inequality assessment (see
+    :mod:`horizon`): how long the migration takes measured against how long
+    the data has to stay confidential. It is absent from the report unless
+    asked for, because it needs an input only the caller knows.
+    """
     score = calculate_score(findings)
     band = risk_band(score)
     counts = count_by_severity(findings)
@@ -34,7 +46,7 @@ def build_report(findings: list[Finding], target: str) -> dict:
                        _REACH_ORDER.get(f.reachability, 0),
                        f.file_path, f.line_number),
     )
-    return {
+    report = {
         "tool": "quantumsafe",
         "version": __version__,
         "target": target,
@@ -50,6 +62,12 @@ def build_report(findings: list[Finding], target: str) -> dict:
         },
         "findings": [f.to_dict() for f in ordered],
     }
+    if endpoint:
+        report["endpoint"] = endpoint
+    if secrecy_years is not None:
+        from .horizon import assess
+        report["horizon"] = assess(findings, secrecy_years, crqc_years).to_dict()
+    return report
 
 
 # --------------------------------------------------------------------------- #
@@ -85,6 +103,8 @@ def print_terminal(report: dict) -> None:
         )
     )
 
+    _print_endpoint(console, report.get("endpoint"))
+
     if not report["findings"]:
         console.print("[green]No quantum-vulnerable cryptography detected.[/green]")
         return
@@ -106,6 +126,202 @@ def print_terminal(report: dict) -> None:
             f["recommendation"],
         )
     console.print(table)
+    _print_horizon(console, report.get("horizon"))
+
+
+def _sarif_location(f: dict) -> dict:
+    """One SARIF location for a finding.
+
+    A code finding is a file and a line. A live-endpoint finding is neither,
+    and pretending otherwise produces output a SARIF consumer acts on wrongly:
+    GitHub code scanning would try to annotate line 1 of a file literally named
+    "github.com [leaf certificate]", which does not exist. The previous
+    `max(1, line_number)` also invented a line number for findings whose line
+    is genuinely 0.
+
+    So endpoint findings get the real https URI as the artifact -- which is a
+    valid URI, unlike a bare hostname with a bracketed suffix -- no region at
+    all, and the certificate position as a logicalLocation.
+    """
+    if f.get("origin") != "endpoint":
+        return {
+            "physicalLocation": {
+                "artifactLocation": {"uri": f["file_path"]},
+                "region": {"startLine": max(1, f["line_number"])},
+            }
+        }
+
+    raw = f.get("file_path") or ""
+    host, _, bracket = raw.partition(" [")
+    location = {
+        "physicalLocation": {"artifactLocation": {"uri": f"https://{host}"}},
+    }
+    if bracket:
+        location["logicalLocations"] = [{
+            "name": bracket.rstrip("]"),
+            "kind": "member",
+        }]
+    return location
+
+
+def print_diff(d: dict) -> None:
+    """Render a diff between two scans (see :mod:`diff`)."""
+    try:
+        from rich.console import Console
+    except ImportError:
+        print(f"\nSince baseline: {d['summary']}")
+        for f in d["new"]:
+            print(f"  NEW   {f.get('file_path')}:{f.get('line_number')} "
+                  f"{f.get('algorithm')}")
+        return
+
+    console = Console()
+    counts = d["counts"]
+    if d["regressed"]:
+        verdict, colour = "REGRESSED", "red"
+    elif d["improved"]:
+        verdict, colour = "IMPROVED", "green"
+    else:
+        verdict, colour = "UNCHANGED", "cyan"
+
+    console.print()
+    console.print(f"[bold]Since baseline[/bold]  [{colour}]{verdict}[/{colour}]")
+    if d["target"]["mismatch"]:
+        console.print(f"  [yellow]Warning: baseline scanned "
+                      f"{d['target']['before']!r} but this scan is "
+                      f"{d['target']['after']!r}; the comparison may be "
+                      f"meaningless.[/yellow]")
+    console.print(f"  [green]{counts['fixed']} fixed[/green]   "
+                  f"[red]{counts['new']} new[/red]   "
+                  f"{counts['unchanged']} unchanged   "
+                  f"score {d['risk_score']['before']} -> "
+                  f"{d['risk_score']['after']} "
+                  f"({d['risk_score']['delta']:+d})")
+
+    for label, colour, items in (("NEW", "red", d["new"]),
+                                 ("FIXED", "green", d["fixed"])):
+        for f in items[:12]:
+            loc = f.get("file_path", "?")
+            line = f.get("line_number")
+            where = f"{loc}:{line}" if line else loc
+            console.print(f"  [{colour}]{label:<5}[/{colour}] {where}  "
+                          f"{f.get('algorithm', '?')} [{f.get('risk_level', '?')}]")
+        if len(items) > 12:
+            console.print(f"  [dim]... and {len(items) - 12} more {label.lower()}[/dim]")
+
+    console.print(f"  [dim]{d['caveat']}[/dim]")
+
+
+def _print_endpoint(console, e: dict | None) -> None:
+    """Render what the TLS handshake actually negotiated."""
+    if not e:
+        return
+    pq = e.get("key_exchange_post_quantum")
+    kex_color = "green" if pq else "red"
+    label = "post-quantum hybrid" if pq else "classical"
+
+    console.print()
+    console.print(f"[bold]TLS handshake[/bold]  {e['host']}:{e['port']}  "
+                  f"[dim]({', '.join(e.get('addresses', []))})[/dim]")
+    console.print(f"  Key exchange   : [{kex_color}]{e['key_exchange']}[/{kex_color}] "
+                  f"({label})")
+    console.print(f"  Protocol       : {e.get('protocol') or 'unknown'}")
+    console.print(f"  Cipher         : {e.get('cipher') or 'unknown'} "
+                  f"({e.get('symmetric_bits')}-bit symmetric)")
+    cert = e.get("certificate") or {}
+    if cert:
+        console.print(f"  Certificate    : {cert.get('subject') or '(see SAN)'} "
+                      f"issued by {cert.get('issuer') or 'unknown'}, "
+                      f"expires {cert.get('not_after') or 'unknown'}")
+    console.print(f"  [dim]Key exchange read via {e.get('key_exchange_observed_via')}; "
+                  "this is the group the server selects from what we offer, "
+                  "not everything it could support.[/dim]")
+
+    tp = e.get("third_party")
+    if tp and not tp.get("error"):
+        console.print()
+        pq, cls = tp["origins_post_quantum"], tp["origins_classical"]
+        colour = "green" if not cls else ("yellow" if pq else "red")
+        console.print(f"[bold]Third-party origins[/bold]  "
+                      f"[{colour}]{pq} post-quantum, {cls} classical[/{colour}]"
+                      f"  of {tp['origins_scanned']} scanned"
+                      f"{' (list truncated)' if tp.get('truncated') else ''}")
+        for r in tp["origins"]:
+            if r["status"] != "scanned":
+                console.print(f"  [dim]{r['host']:<36} {r['status']}[/dim]")
+                continue
+            c = "green" if r["post_quantum"] else "red"
+            console.print(f"  [{c}]{r['host']:<36}[/{c}] {r['key_exchange']}")
+    elif tp and tp.get("error"):
+        console.print()
+        console.print(f"[yellow]Third-party origins: {tp['error']}[/yellow]")
+
+    chain = e.get("chain") or []
+    if chain:
+        console.print()
+        console.print("[bold]Certificate chain[/bold] "
+                      "[dim](a chain is only as strong as its weakest "
+                      "signature)[/dim]")
+        for c in chain:
+            if "error" in c:
+                console.print(f"  {c['role']:<13} [yellow]unparseable: "
+                              f"{c['error']}[/yellow]")
+                continue
+            key = c.get("key_algorithm", "?")
+            if c.get("key_curve"):
+                key += f" {c['key_curve']}"
+            elif c.get("key_bits"):
+                key += f"-{c['key_bits']}"
+            safe = c.get("signature_post_quantum") or c.get("key_post_quantum")
+            # A root is trusted via the client's trust store, not its own
+            # self-signature, so it is shown without a risk colour.
+            if c["role"] == "root":
+                colour = "dim"
+                note = ("  [dim](trust-store anchored; its own signature is "
+                        "not a forgery risk)[/dim]")
+            else:
+                colour = "green" if safe else "red"
+                note = ""
+            console.print(f"  [{colour}]{c['role']:<13}[/{colour}] "
+                          f"sig={c.get('signature', '?'):<22} key={key}{note}")
+
+
+_HORIZON_COLOR = {
+    "already_late": "red",
+    "at_risk": "yellow",
+    "on_track": "green",
+    "no_verdict": "cyan",
+}
+
+
+def _print_horizon(console, h: dict | None) -> None:
+    """Render the Mosca assessment, if one was requested."""
+    if not h:
+        return
+    y = h["migration_years"]
+    be = h["breakeven_year"]
+    color = _HORIZON_COLOR.get(h["verdict"], "white")
+
+    console.print()
+    console.print("[bold]Migration horizon[/bold] (Mosca's inequality)")
+    console.print(f"  Data must stay confidential (X) : {h['secrecy_years']:g} years")
+    console.print(f"  Estimated migration (Y)         : {y['low']:g}-{y['high']:g} years")
+    if h["crqc_years"] is not None:
+        console.print(f"  Assumed quantum threat (Z)      : {h['crqc_years']:g} years")
+    else:
+        console.print("  Assumed quantum threat (Z)      : not supplied")
+    # X + Y: the deadline, and the only figure here that needs no guess about Z.
+    if be["low"] == be["high"]:
+        console.print(f"  Break-even year                 : {be['low']}")
+    else:
+        console.print(f"  Break-even year                 : {be['low']}-{be['high']}")
+    console.print(f"  [{color}]{h['verdict'].replace('_', ' ').upper()}[/{color}] "
+                  f"{h['message']}")
+    if h["asymmetric_families"]:
+        console.print(f"  Design changes needed           : "
+                      f"{', '.join(h['asymmetric_families'])}")
+    console.print("  [dim]Estimate rests on stated assumptions; see "
+                  "\"assumptions\" in the JSON report.[/dim]")
 
 
 def _location(f: dict) -> str:
@@ -326,12 +542,7 @@ def to_sarif(report: dict) -> str:
             "ruleId": f["family"],
             "level": level_map.get(f["risk_level"], "warning"),
             "message": {"text": f"{f['algorithm']}: {f['why']} Replace with {f['recommendation']}."},
-            "locations": [{
-                "physicalLocation": {
-                    "artifactLocation": {"uri": f["file_path"]},
-                    "region": {"startLine": max(1, f["line_number"])},
-                }
-            }],
+            "locations": [_sarif_location(f)],
         })
 
     sarif = {
@@ -341,7 +552,7 @@ def to_sarif(report: dict) -> str:
             "tool": {"driver": {
                 "name": "QuantumSafe",
                 "version": report.get("version", ""),
-                "informationUri": "https://github.com/Danny-397/Quantum-Safe",
+                "informationUri": "https://github.com/Danny-397/Quantum-Safe-Scan",
                 "rules": rules,
             }},
             "results": results,
